@@ -7,25 +7,20 @@ Authors: Insu Han, Zeliang Zhang, Zhiyuan Wang, Yifan Zhu, Susan Liang, Jiani Li
 
 This repository provides a guide for setting up and running InternVL with KVcacheQuant for efficient inference.
 
-# Installation
+## Installation
 
 1. Install required packages (e.g., InternVL,  Triton):
 ```python
 pip install internvl triton==3.2.0
 ```
-2. Download the InternVL2.5-26B/8B model from Hugging Face and place it in the checkpoints folder:
 
-```bash
-mkdir -p checkpoints
-cd checkpoints
-wget https://huggingface.co/OpenGVLab/InternVL2_5-26B
-cd ..
-```
+2. Download the InternVL2.5-26B/8B model from HuggingFace:
+
 
 ## Modify Parameters
 
-1. Change batch size
-2. Set bit number
+1. Change batch size (line 104 in ``infer.py``)
+2. Set bit number (line 13 in ``calibquant.py``)
 3. Run Inference
 ```python
 python infer.py
@@ -37,3 +32,12 @@ python infer.py
 - Modify parameters accordingly for optimal performance based on your hardware.
 - If you encounter issues, refer to the official documentation or repository.
 
+## Citation
+```bib
+@article{,
+  title={From 16-Bit to 1-Bit: Visual KV Cache Quantization for Memory-Efficient Multimodal Large Language Models},
+  author={Zhang, Zeliang and Zhu, Yifan and Liang, Susan and Wang, Zhiyuan and Liu, Jiani and Lin, Haiting and Zhao, Mingjie and Xu, Chenliang and Wan, Kun and Zhao, Wentian},
+  journal={arXiv preprint arXiv:2502.14882},
+  year={2025}
+}
+```

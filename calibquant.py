@@ -42,7 +42,6 @@ def quant(x, bits, per_channel=False, scale=1, post_scale=False):
         return x, scale, zero_point
 
 
-
 # triton implementation of dequantization
 # @triton.jit
 def get_kernel3_configs():
