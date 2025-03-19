@@ -1,4 +1,4 @@
-# CalibQaunt
+# CalibQuant: 1-Bit KV Cache Quantization via Calibration for Multimodal LLMs 
 
 Code for the paper "[1-Bit KV Cache Quantization for Multimodal LLMs](https://arxiv.org/pdf/2502.14882v1)"
 
