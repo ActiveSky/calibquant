@@ -1,6 +1,6 @@
 # CalibQuant: 1-Bit KV Cache Quantization via Calibration for Multimodal LLMs 
 
-Code for the paper "[1-Bit KV Cache Quantization for Multimodal LLMs](https://arxiv.org/abs/2502.14882)"
+Code for the paper "[CalibQuant: 1-Bit KV Cache Quantization for Multimodal LLMs](https://arxiv.org/abs/2502.14882)"
 
 Authors: Insu Han, Zeliang Zhang, Zhiyuan Wang, Yifan Zhu, Susan Liang, Jiani Liu, Haiting Lin, Mingjie Zhao, Chenliang Xu, Kun Wan, Wentian Zhao
 
