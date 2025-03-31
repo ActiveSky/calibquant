@@ -35,8 +35,8 @@ python infer.py
 ## Citation
 ```bib
 @article{,
-  title={From 16-Bit to 1-Bit: Visual KV Cache Quantization for Memory-Efficient Multimodal Large Language Models},
-  author={Zhang, Zeliang and Zhu, Yifan and Liang, Susan and Wang, Zhiyuan and Liu, Jiani and Lin, Haiting and Zhao, Mingjie and Xu, Chenliang and Wan, Kun and Zhao, Wentian},
+  title={CalibQuant: 1-Bit KV Cache Quantization via Calibration for Multimodal LLMs},
+  author={Han, Insu and Zhang, Zeliang and Zhu, Yifan and Liang, Susan and Wang, Zhiyuan and Liu, Jiani and Lin, Haiting and Zhao, Mingjie and Xu, Chenliang and Wan, Kun and Zhao, Wentian},
   journal={arXiv preprint arXiv:2502.14882},
   year={2025}
 }
