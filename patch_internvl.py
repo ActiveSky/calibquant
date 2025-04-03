@@ -541,16 +541,3 @@ def patch_model(model, quant_method='calibquant', **kwargs):
         seed = kwargs.get('seed', 1234)
         generator = torch.Generator(device='cuda').manual_seed(seed)
         model.config.llm_config.qjl = QJLSketch(dim=(128, k_bits * 128), dim_outlier=256, rot=True, rng=generator)
-        # model.config.llm_config.qjl = QJLSketch(dim=(128, k_bits), dim_outlier=256, rot=True, rng=generator)
-
-        # self.key_quantization_bits = config.key_quantization_bits
-
-        # self.qjl_initial_layers = config.qjl_initial_layers
-        # self.key_quantization_bits_initial_layers = config.key_quantization_bits_initial_layers
-
-        # self.outlier_count_initial_layers = config.outlier_count_initial_layers
-        # self.outlier_count_general = config.outlier_count_general
-
-        # self.value_quantization_bits = config.value_quantization_bits
-        # self.group_size = config.group_size
-        # self.buffer_size = config.buffer_size
