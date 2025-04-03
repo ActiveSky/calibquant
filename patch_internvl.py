@@ -9,6 +9,12 @@ from einops import rearrange
 
 from calibquant import quant, fused_kernel, fused_kernel_wv, encode
 
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from qjl.qjl_utils import QJLSketch, QJLKeyQuantizer, repeat_kv_quant
+from qjl.matmul import cuda_quantized_bmm_dynamic
+from qjl.new_pack import triton_quantize_and_pack_along_last_dim
+
+
 # global hyperparameters for quantization
 BITS_KV = 1
 
@@ -131,7 +137,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def forward_internlm2flashattn2(
+def forward_internlm2_calibquant(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.LongTensor] = None,
@@ -190,12 +196,9 @@ def forward_internlm2flashattn2(
         else:
             kv_seq_len += past_key_value[0].shape[-2]        
 
-    try:
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-    except:
-        import pdb;pdb.set_trace();
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     if past_key_value is not None:
         # reuse k, v, self_attention
@@ -364,21 +367,190 @@ def forward_internlm2flashattn2(
     return attn_output, attn_weights, past_key_value
 
 
-def patch_model(model):
+class _dummy_class_for_accessing_shape:
+    def __init__(self, kv_seq_len):
+        self.shape = (-1,-1,kv_seq_len,-1)
+
+
+def forward_internlm2_qjl(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    
+    self.sprompt_len = SPROMPT_LEN
+    self.image_token_num=int(os.environ.get('IMAGE_TOKEN_NUM'))
+
+    if 'padding_mask' in kwargs:
+        warnings.warn(
+            'Passing `padding_mask` is deprecated and will be removed in v4.37. '
+            'Please make sure use `attention_mask` instead.`'
+        )
+
+        # overwrite attention_mask with padding_mask
+        attention_mask = kwargs.pop('padding_mask')
+
+    output_attentions = False
+
+    bsz, q_len, _ = hidden_states.size()
+
+    qkv_states = self.wqkv(hidden_states)
+
+    qkv_states = rearrange(
+        qkv_states,
+        'b q (h gs d) -> b q h gs d',
+        gs=2 + self.num_key_value_groups,
+        d=self.head_dim,
+    )
+
+    query_states = qkv_states[..., : self.num_key_value_groups, :]
+    query_states = rearrange(query_states, 'b q h gs d -> b q (h gs) d')
+    key_states = qkv_states[..., -2, :]
+    value_states = qkv_states[..., -1, :]
+
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]        
+
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if past_key_value is not None:
+        # reuse k, v, self_attention
+        #  = past_key_value[0].shape[0]
+        kv_quant = past_key_value[1]
+        key_states_sys = past_key_value[2]
+        key_states_txt = past_key_value[3]
+        value_states_quant = past_key_value[4]
+        value_scale = past_key_value[5]
+        value_mn = past_key_value[6]
+        value_states_sys = past_key_value[7]
+        value_states_txt = past_key_value[8]
+
+        # original: [system, visual, text + new]
+        key_states_txt = torch.cat([key_states_txt, key_states], dim=2)
+        att_qk_sys = query_states @ repeat_kv(key_states_sys, self.num_key_value_groups).transpose(2, 3)
+        att_qk_txt = query_states @ repeat_kv(key_states_txt, self.num_key_value_groups).transpose(2, 3)
+        att_qk = torch.cat((att_qk_sys, kv_quant.attention_score(query_states), att_qk_txt), dim=-1)
+        attn_weights = att_qk / self.head_dim ** 0.5
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+            attn_weights = torch.max(
+                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
+            )
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        value_states_txt = torch.cat([value_states_txt, value_states], dim=2)
+        value_full_length = value_states_txt.shape[-2]
+        if value_states_quant is None:
+            raise NotImplementedError("value_states_quant is None")
+        else:
+            # visual part (middle)
+            value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
+            value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
+            value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
+            attn_output = cuda_quantized_bmm_dynamic(
+                self.config.group_size,
+                attn_weights[:, :, :, self.sprompt_len:self.sprompt_len+self.image_token_num],
+                value_states_quant_repeat, value_scale_repeat, value_mn_repeat, self.config.v_bits)
+            # system_prompt & text parts (first and last)
+            value_states_sys_repeat = repeat_kv(value_states_sys, self.num_key_value_groups)
+            value_states_txt_repeat = repeat_kv(value_states_txt, self.num_key_value_groups)
+            attn_output += attn_weights[..., self.sprompt_len+self.image_token_num:] @ value_states_txt_repeat \
+                + attn_weights[..., :self.sprompt_len] @ value_states_sys_repeat
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        past_key_value = (
+            _dummy_class_for_accessing_shape(kv_seq_len),
+            kv_quant, key_states_sys, key_states_txt,
+            value_states_quant, value_scale, value_mn, value_states_sys, value_states_txt,
+            ) if use_cache else None
+    else:
+        input_dtype = query_states.dtype
+        key_states_repeat = repeat_kv(key_states, self.num_key_value_groups)
+        value_states_repeat = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = _flash_attention_forward(
+            query_states.transpose(1, 2), key_states_repeat.transpose(1, 2),
+            value_states_repeat.transpose(1, 2), None, q_len, dropout=0.0, is_causal=self.is_causal,
+        )
+
+        split_kv = lambda x: x.split([self.sprompt_len, self.image_token_num, q_len-self.sprompt_len-self.image_token_num], dim=-2)
+
+        kv_quant = QJLKeyQuantizer(self.config.qjl, self.config.outlier_count_general, self.config.buffer_size, self.config.group_size, self.config.k_bits)
+        key_states_sys, key_states_v, key_states_txt = split_kv(key_states)
+        kv_quant.build_sketch(key_states_v)
+        
+        value_states_sys, value_states_v, value_states_txt = split_kv(value_states)
+        if value_states.shape[-2] <= self.config.buffer_size:
+            raise NotImplementedError("value_states.shape[-2] <= self.config.buffer_size")
+        else:
+            value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(
+                value_states_v.contiguous(), self.config.group_size, self.config.v_bits)
+
+        past_key_value = (
+            _dummy_class_for_accessing_shape(kv_seq_len),
+            kv_quant, key_states_sys, key_states_txt,
+            value_states_quant, value_scale, value_mn, value_states_sys, value_states_txt,
+            ) if use_cache else None
+
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = self.wo(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+    
+    return attn_output, attn_weights, past_key_value
+
+
+ATTN_FORWARD_FUNCTIONS = {
+    "calibquant": forward_internlm2_calibquant, 
+    "qjl": forward_internlm2_qjl,
+}
+
+
+def patch_model(model, quant_method='calibquant', **kwargs):
     print("Patching InternVLChatModel.generate function ...")
     model.__class__.generate = custom_generate
 
-    print("Patching InternLM2FlashAttention2.forward function ...")
-    model.language_model.model.layers[0].attention.__class__.forward = forward_internlm2flashattn2
+    print(f"Patching InternLM2FlashAttention2.forward function ... {quant_method}")
+    model.language_model.model.layers[0].attention.__class__.forward = ATTN_FORWARD_FUNCTIONS[quant_method]
 
-    # model.language_model.model.layers[0].attention.config
+    if quant_method == 'qjl':
+        model.config.llm_config.k_bits = k_bits = kwargs.get('k_bits', 2)
+        model.config.llm_config.v_bits = kwargs.get('v_bits', 2)
+        model.config.llm_config.group_size = kwargs.get('group_size', 32)
+        model.config.llm_config.buffer_size = kwargs.get('buffer_size', 128)
+        model.config.llm_config.outlier_count_general = kwargs.get('outlier_count_general', 32)
+        seed = kwargs.get('seed', 1234)
+        generator = torch.Generator(device='cuda').manual_seed(seed)
+        model.config.llm_config.qjl = QJLSketch(dim=(128, k_bits * 128), dim_outlier=256, rot=True, rng=generator)
+        # model.config.llm_config.qjl = QJLSketch(dim=(128, k_bits), dim_outlier=256, rot=True, rng=generator)
 
-    # self.sprompt_len = SPROMPT_LEN
-    # self.bits_v = BITS_KV
-    # self.scale_v = SCALE_V
-    # self.per_channel_v =True
-    # self.bits_k = BITS_KV
-    # self.scale_k = SCALE_K
-    # self.per_channel_k = True
-    # self.image_token_num=int(os.environ.get('IMAGE_TOKEN_NUM'))
-    # self.normalize = BITS_KV <= 2
+        # self.key_quantization_bits = config.key_quantization_bits
+
+        # self.qjl_initial_layers = config.qjl_initial_layers
+        # self.key_quantization_bits_initial_layers = config.key_quantization_bits_initial_layers
+
+        # self.outlier_count_initial_layers = config.outlier_count_initial_layers
+        # self.outlier_count_general = config.outlier_count_general
+
+        # self.value_quantization_bits = config.value_quantization_bits
+        # self.group_size = config.group_size
+        # self.buffer_size = config.buffer_size

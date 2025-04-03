@@ -99,7 +99,8 @@ tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast
 
 model = model.eval().requires_grad_(False)
 
-patch_model(model)
+quant_method = "qjl"
+patch_model(model, quant_method)
 
 batch_size = 1 #24
 
