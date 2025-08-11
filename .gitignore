@@ -1,2 +1,7 @@
 #my addition
 my_test/
+.vscode/
+# everywhere __pycache__/
+**/__pycache__/
+
+qjl_cuda.egg-info/

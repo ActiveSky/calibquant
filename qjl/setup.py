@@ -1,3 +1,13 @@
+import sys
+
+# 构建前确保torch可用
+try:
+    import torch
+    print(f"验证成功: 找到PyTorch {torch.__version__}")
+except ImportError:
+    print("错误：构建需要PyTorch，请先执行 pip install torch")
+    sys.exit(1)
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import os

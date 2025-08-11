@@ -8,21 +8,67 @@ from transformers import AutoModel, AutoTokenizer
 
 from patch_internvl import patch_model
 
+#ImageNet 数据集的均值和标准差，用于图像归一化
+IMAGENET_MEAN = (0.485, 0.456, 0.406) #均值
+IMAGENET_STD = (0.229, 0.224, 0.225) #标准差
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
+#图像预处理函数
 def build_transform(input_size):
+    """
+    构建图像预处理转换流程。
+
+    Args:
+        input_size (int): 目标图像的尺寸，用于调整图像大小。
+
+    Returns:
+        torchvision.transforms.Compose: 包含一系列图像转换操作的组合对象。
+
+    Note:
+        该转换流程包含以下步骤：
+        1. 确保图像为RGB模式
+        2. 调整图像大小为指定尺寸
+        3. 将图像转换为张量
+        4. 使用ImageNet的均值和标准差进行归一化
+
+    Example:
+        >>> transform = build_transform(224)
+        >>> img = Image.open("example.jpg")
+        >>> img_tensor = transform(img)
+    """
     MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
     transform = T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img), #将图像转换为RGB模式
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),#调整图像大小为
+        T.ToTensor(), #将图像转换为张量
+        T.Normalize(mean=MEAN, std=STD) #归一化
     ])
     return transform
 
+
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    """
+    根据给定的目标宽高比列表，找到与输入图像宽高比最接近的目标宽高比。
+    
+    参数:
+        aspect_ratio (float): 输入图像的宽高比（width/height）
+        target_ratios (list): 目标宽高比列表，每个元素是一个元组(width, height)
+        width (int): 输入图像的宽度
+        height (int): 输入图像的高度
+        image_size (int): 目标图像的尺寸
+    
+    返回:
+        tuple: 最佳匹配的目标宽高比，格式为(width, height)
+    
+    算法说明:
+        1. 初始化最佳差异为无穷大，最佳比例为(1,1)
+        2. 计算输入图像的面积
+        3. 遍历所有目标宽高比:
+           a. 计算当前目标宽高比的值
+           b. 计算与输入宽高比的差异
+           c. 如果找到更好的匹配(差异更小)，则更新最佳比例
+           d. 如果差异相同，则选择面积更大的比例
+        4. 返回最佳匹配的比例
+    """
     best_ratio_diff = float('inf')
     best_ratio = (1, 1)
     area = width * height
@@ -37,7 +83,29 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
                 best_ratio = ratio
     return best_ratio
 
+
 def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    """
+    动态预处理图像，将其分割成多个块以适应不同的宽高比。
+
+    参数:
+        image (PIL.Image): 输入的图像对象。
+        min_num (int, optional): 分割块的最小数量，默认为1。
+        max_num (int, optional): 分割块的最大数量，默认为12。
+        image_size (int, optional): 每个分割块的大小，默认为448。
+        use_thumbnail (bool, optional): 是否添加缩略图，默认为False。
+
+    返回:
+        list: 包含处理后的图像块的列表。
+
+    功能说明:
+        1. 计算原始图像的宽高比。
+        2. 生成符合最小和最大块数限制的所有可能的宽高比组合。
+        3. 找到与原始图像宽高比最接近的目标宽高比。
+        4. 根据目标宽高比计算目标宽度和高度，并确定分割块的数量。
+        5. 将图像调整到目标大小并分割成多个块。
+        6. 如果需要，添加一个缩略图到结果列表中。
+    """
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
@@ -76,6 +144,25 @@ def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbna
     return processed_images
 
 def load_image(image_file, input_size=448, max_num=12):
+    """
+    加载并预处理图像文件，将其转换为模型可接受的格式。
+
+    Args:
+        image_file (str): 图像文件的路径。
+        input_size (int, optional): 输入图像的目标大小。默认值为448。
+        max_num (int, optional): 最大处理的图像数量。默认值为12。
+
+    Returns:
+        torch.Tensor: 预处理后的图像像素值张量，形状为 (batch_size, channels, height, width)。
+
+    Note:
+        该函数会执行以下步骤：
+        1. 打开图像文件并转换为RGB格式
+        2. 构建图像预处理转换
+        3. 动态预处理图像，生成多个缩略图（如果需要）
+        4. 对每张图像应用预处理转换
+        5. 将所有图像像素值堆叠成一个张量
+    """
     image = Image.open(image_file).convert('RGB')
     transform = build_transform(input_size=input_size)
     images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
@@ -85,41 +172,111 @@ def load_image(image_file, input_size=448, max_num=12):
 
 # If you have an 80G A100 GPU, you can put the entire model on a single GPU.
 # Otherwise, you need to load a model using multiple GPUs, please refer to the `Multiple GPUs` section.
-path = "OpenGVLab/InternVL2_5-8B"
-dtype = torch.bfloat16
-device = 'cuda'
-model = AutoModel.from_pretrained(
-    path,
-    torch_dtype=dtype,
-    low_cpu_mem_usage=True,
-    use_flash_attn=True,
-    trust_remote_code=True,
-    device_map='auto')
-tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
 
-model = model.eval().requires_grad_(False)
-
-quant_method = "qjl"
-patch_model(model, quant_method)
-
-batch_size = 1 #24
-
-# set the max number of tiles in `max_num`
-generation_config = dict(max_new_tokens=300, do_sample=True)
- 
-# batch inference, single image per sample
-pixel_values1 = load_image('test.png', max_num=12).to(dtype=model.dtype, device=model.device)
-
-num_patches_list = [pixel_values1.size(0)]*batch_size
-pixel_values = torch.cat([pixel_values1]*batch_size, dim=0)
-
-questions = ['<image>\nDescribe the image in 100 words.'] * len(num_patches_list)
-
-responses = model.batch_chat(tokenizer, pixel_values,
-                                num_patches_list=num_patches_list,
-                                questions=questions,
-                                generation_config=generation_config)
-
-for question, response in zip(questions, responses):
-    print(f'User: {question}\nAssistant: {response}')
+def load_model(
+    model_path: str = "OpenGVLab/InternVL2_5-8B",
+    dtype: torch.dtype = torch.bfloat16,
+    quant_method: str = "qjl",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+) -> tuple:
+    """
+    加载预训练模型并应用量化
     
+    参数:
+        model_path: 模型路径或HuggingFace标识符
+        dtype: 模型计算精度
+        quant_method: 量化方法
+        device: 目标设备
+        
+    返回:
+        (model, tokenizer) 元组
+    """
+    model = AutoModel.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        use_flash_attn=True,
+        trust_remote_code=True,
+        device_map='auto' if device == "cuda" else None
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, 
+        trust_remote_code=True, 
+        use_fast=False
+    )
+    model = model.eval().requires_grad_(False).to(device)
+    patch_model(model, quant_method)
+    return model, tokenizer
+
+def run_inference(
+    model: AutoModel,
+    tokenizer: AutoTokenizer,
+    image_path: str = "test.png",
+    question: str = "<image>\nDescribe the image in 100 words.",
+    max_num: int = 12,
+    batch_size: int = 1,
+    max_new_tokens: int = 300,
+    do_sample: bool = True
+) -> list:
+    """
+    执行图像描述生成推理
+    
+    参数:
+        model: 预加载的模型
+        tokenizer: 预加载的分词器
+        image_path: 输入图像路径
+        question: 提示问题模板
+        max_num: 最大分块数
+        batch_size: 批处理大小
+        max_new_tokens: 生成的最大token数
+        do_sample: 是否使用采样生成
+        
+    返回:
+        模型生成的描述列表
+    """
+    generation_config = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
+    
+    # 加载并预处理图像
+    pixel_values = load_image(image_path, max_num=max_num)
+    pixel_values = pixel_values.to(dtype=model.dtype, device=model.device)
+    
+    # 构造批处理数据
+    num_patches_list = [pixel_values.size(0)] * batch_size
+    pixel_values_batch = torch.cat([pixel_values]*batch_size, dim=0)
+    
+    # 构造问题列表
+    questions = [question] * len(num_patches_list)
+    
+    # 执行批量推理
+    responses = model.batch_chat(
+        tokenizer,
+        pixel_values_batch,
+        num_patches_list=num_patches_list,
+        questions=questions,
+        generation_config=generation_config
+    )
+    return responses
+
+# 原有代码保持不变...
+
+if __name__ == "__main__":
+    # 加载模型
+    model, tokenizer = load_model(
+        model_path="OpenGVLab/InternVL2_5-8B",
+        dtype=torch.bfloat16,
+        quant_method="qjl"
+    )
+    
+    # 执行推理
+    responses = run_inference(
+        model,
+        tokenizer,
+        image_path="test.png",
+        question="<image>\nDescribe the image in 100 words.",
+        max_num=12,
+        batch_size=1
+    )
+    
+    # 输出结果
+    for response in responses:
+        print(f"Assistant: {response}")

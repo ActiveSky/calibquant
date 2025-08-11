@@ -14,6 +14,7 @@ from qjl.qjl_utils import QJLSketch, QJLKeyQuantizer, repeat_kv_quant
 from qjl.matmul import cuda_quantized_bmm_dynamic
 from qjl.new_pack import triton_quantize_and_pack_along_last_dim
 
+import warnings
 
 # global hyperparameters for quantization
 BITS_KV = 1
