@@ -111,12 +111,31 @@ def fused_kernel(unique_values : torch.Tensor, weights : torch.Tensor, features_
     return output
 
 # change this to encoded kernel in production
-@torch.compile
+@torch.compile  # 使用torch.compile装饰器来优化该函数的性能
 def encode(X : torch.Tensor, bits=BITS_KV, datum_per_elem=int(8/BITS_KV)):
+    """
+    将输入的张量X编码为更紧凑的表示形式
+    
+    参数:
+        X (torch.Tensor): 输入的张量
+        bits (int): 每个元素使用的位数，默认为BITS_KV
+        datum_per_elem (int): 每个原始元素编码后的元素数量，默认为int(8/BITS_KV)
+    
+    返回:
+        torch.uint8: 编码后的张量，数据类型为无符号8位整数
+    """
+    # 计算目标张量的形状，将原始张量的最后一个维度分割为两个维度
     target_shape = (X.shape[0], X.shape[1],X.shape[2],X.shape[3]//datum_per_elem,datum_per_elem)
+    
+    # 重塑张量以匹配目标形状
     Y = X.reshape(target_shape)
+    
+    # 计算每个元素需要移位的位数，用于后续的位操作
     shift = (bits*(datum_per_elem - 1 - torch.arange(0, datum_per_elem, device=X.device)))[None, None, None, None, :]
+    
+    # 通过移位和求和操作实现编码，并将结果转换为无符号8位整数
     return (Y << shift).sum(axis=4).to(torch.uint8)
+
 
 
 # @triton.jit

@@ -148,32 +148,74 @@ def forward_internlm2_calibquant(
     use_cache: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """
+    `forward_internlm2_calibquant` 函数是 InternLM2 模型注意力机制的前向传播函数，
+    它实现了对 KV 缓存进行量化（低比特量化）以节省显存，并在推理时进行反量化计算。
+    该函数旨在优化模型在生成长序列时的性能和内存占用。
 
+    参数:
+        self: 当前注意力层的实例。
+        hidden_states: 输入的隐藏状态张量。
+        attention_mask: 注意力掩码，用于阻止模型关注填充或未来标记。
+        position_ids: 位置 ID，用于旋转位置嵌入。
+        past_key_value: 过去的键值对，用于增量解码。
+        output_attentions: 是否输出注意力权重。
+        use_cache: 是否缓存键值对。
+        **kwargs: 其他关键字参数。
+
+    返回值:
+        一个元组，包含：
+        - attn_output: 注意力机制的输出。
+        - attn_weights: 注意力权重（如果 output_attentions 为 True）。
+        - past_key_value: 更新后的键值对缓存。
+    """
+
+    # 1. 初始化量化相关的超参数
+    # 设置 SPROMPT_LEN，表示系统提示的长度。
     self.sprompt_len = SPROMPT_LEN
+    # 设置 KV 值的比特数。
     self.bits_v = BITS_KV
+    # 设置 V 值的缩放因子。
     self.scale_v = SCALE_V
+    # 设置 V 值是否按通道量化。
     self.per_channel_v =True
+    # 设置 K 值的比特数。
     self.bits_k = BITS_KV
+    # 设置 K 值的缩放因子。
     self.scale_k = SCALE_K
+    # 设置 K 值是否按通道量化。
     self.per_channel_k = True
+    # 从环境变量中获取图像 token 的数量。
     self.image_token_num=int(os.environ.get('IMAGE_TOKEN_NUM'))
+    # 根据 KV 比特数设置是否进行归一化。
     self.normalize = BITS_KV <= 2
 
+    # 2. 处理废弃的 `padding_mask` 参数
+    # 检查 `kwargs` 中是否存在 `padding_mask`。
     if 'padding_mask' in kwargs:
+        # 发出警告，提示 `padding_mask` 已废弃。
         warnings.warn(
             'Passing `padding_mask` is deprecated and will be removed in v4.37. '
             'Please make sure use `attention_mask` instead.`'
         )
-
-        # overwrite attention_mask with padding_mask
+        # 用 `padding_mask` 覆盖 `attention_mask`。
         attention_mask = kwargs.pop('padding_mask')
 
+    # 3. 强制设置 `output_attentions` 为 False
+    # 无论输入如何，都将 `output_attentions` 设置为 False，表示不输出注意力权重。
     output_attentions = False
 
+    # 4. 获取输入张量的维度
+    # 获取批次大小 (bsz)、查询序列长度 (q_len) 和隐藏状态维度。
     bsz, q_len, _ = hidden_states.size()
 
+    # 5. 计算 QKV 状态
+    # 通过线性层 `self.wqkv` 将隐藏状态转换为 QKV 状态。
     qkv_states = self.wqkv(hidden_states)
 
+    # 6. 重排 QKV 状态
+    # 使用 `einops.rearrange` 将 QKV 状态重排为 `(b, q, h, gs, d)` 形状，
+    # 其中 `gs` 是 2 + `num_key_value_groups`，用于分离 Q、K、V。
     qkv_states = rearrange(
         qkv_states,
         'b q (h gs d) -> b q h gs d',
@@ -181,108 +223,156 @@ def forward_internlm2_calibquant(
         d=self.head_dim,
     )
 
+    # 7. 分离 Query, Key, Value 状态
+    # 提取 Query 状态。
     query_states = qkv_states[..., : self.num_key_value_groups, :]
+    # 重排 Query 状态以合并 `h` 和 `gs` 维度。
     query_states = rearrange(query_states, 'b q h gs d -> b q (h gs) d')
+    # 提取 Key 状态。
     key_states = qkv_states[..., -2, :]
+    # 提取 Value 状态。
     value_states = qkv_states[..., -1, :]
 
+    # 8. 转置 Query, Key, Value 状态
+    # 将 Query 状态的维度从 `(b, q, h, d)` 转置为 `(b, h, q, d)`。
     query_states = query_states.transpose(1, 2)
+    # 将 Key 状态的维度从 `(b, q, h, d)` 转置为 `(b, h, q, d)`。
     key_states = key_states.transpose(1, 2)
+    # 将 Value 状态的维度从 `(b, q, h, d)` 转置为 `(b, h, q, d)`。
     value_states = value_states.transpose(1, 2)
 
+    # 9. 计算 KV 序列长度
+    # 初始化 KV 序列长度为当前 Key 状态的序列长度。
     kv_seq_len = key_states.shape[-2]
+    # 如果存在 `past_key_value` (即缓存)，则更新 KV 序列长度。
     if past_key_value is not None:
+        # 如果是低比特模式，需要考虑图像 token 的数量。
         if LOW_BITS:
             kv_seq_len += (past_key_value[0].shape[-2]+int(os.environ.get('IMAGE_TOKEN_NUM')))
+        # 否则，只加上缓存的 Key 序列长度。
         else:
             kv_seq_len += past_key_value[0].shape[-2]        
 
+    # 10. 应用旋转位置嵌入 (RoPE)
+    # 计算旋转嵌入的 cos 和 sin 值。
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
+    # 将旋转位置嵌入应用到 Query 和 Key 状态。
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+    # 11. 更新 `past_key_value` 缓存
+    # 如果存在 `past_key_value`，则将当前 Key 和 Value 状态与缓存拼接。
     if past_key_value is not None:
-        # reuse k, v, self_attention
         key_states = torch.cat([past_key_value[0], key_states], dim=2)
         value_states = torch.cat([past_key_value[1], value_states], dim=2)
+    # 如果是低比特模式且 Query 序列长度大于 1，则对 Key 和 Value 状态进行特殊处理。
     if LOW_BITS and query_states.shape[2]>1:
+        # 将 Key 和 Value 状态分割成系统提示部分和非图像 token 部分，用于缓存。
         key_states_st = torch.cat([key_states[:,:,:self.sprompt_len,:],key_states[:,:,self.sprompt_len+self.image_token_num:,:]],dim=2)
         value_states_st = torch.cat([value_states[:,:,:self.sprompt_len,:],value_states[:,:,self.sprompt_len+self.image_token_num:,:]],dim=2)
+        # 更新 `past_key_value` 缓存。
         past_key_value = (key_states_st, value_states_st) if use_cache else None
+    # 否则，直接更新 `past_key_value` 缓存。
     else:
         past_key_value = (key_states, value_states) if use_cache else None
 
+    # 12. 再次转置 Query, Key, Value 状态
+    # 将 Query 状态的维度从 `(b, h, q, d)` 转置回 `(b, q, h, d)`。
     query_states = query_states.transpose(1, 2)
+    # 将 Key 状态的维度从 `(b, h, q, d)` 转置回 `(b, q, h, d)`。
     key_states = key_states.transpose(1, 2)
+    # 将 Value 状态的维度从 `(b, h, q, d)` 转置回 `(b, q, h, d)`。
     value_states = value_states.transpose(1, 2)
 
 
+    # 13. 低比特量化处理 (仅当 `LOW_BITS` 为 True 且 `query_states.shape[1] > 1` 时)
     if LOW_BITS and query_states.shape[1] > 1: 
+        # 提取图像相关的 Value 状态。
         value_states_v = value_states[:,self.sprompt_len:self.sprompt_len+self.image_token_num,:,:]
+        # 对 Value 状态进行量化，并获取反量化后的值、缩放因子和零点。
         value_states_deq, self.scale_value, self.zero_point_value = quant(value_states_v, bits=self.bits_v, per_channel=self.per_channel_v,scale = self.scale_v, post_scale=True)
 
+        # 提取图像相关的 Key 状态。
         key_states_v = key_states[:,self.sprompt_len:self.sprompt_len+self.image_token_num,:,:]
+        # 对 Key 状态进行量化，并获取反量化后的值、缩放因子和零点。
         key_states_deq, self.scale_key, self.zero_point_key = quant(key_states_v, bits=self.bits_k, per_channel=self.per_channel_k, scale = self.scale_k, post_scale=True)
 
+        # 转置并重复 Key 的缩放因子和零点，以匹配 Query 的维度。
         self.scale_key = self.scale_key.transpose(1, 2)
         self.scale_key = repeat_kv(self.scale_key, self.num_key_value_groups)
         self.zero_point_key = self.zero_point_key.transpose(1, 2)
         self.zero_point_key = repeat_kv(self.zero_point_key, self.num_key_value_groups)
         
+        # 转置并重复 Value 的缩放因子和零点，以匹配 Query 的维度。
         self.scale_value = self.scale_value.transpose(1, 2)
         self.scale_value = repeat_kv(self.scale_value, self.num_key_value_groups)
         self.zero_point_value = self.zero_point_value.transpose(1, 2)
         self.zero_point_value = repeat_kv(self.zero_point_value, self.num_key_value_groups)
         
+        # 转置反量化后的 Key 和 Value 状态。
         key_states_deq = key_states_deq.transpose(1, 2)
         value_states_deq = value_states_deq.transpose(1, 2)
+        # 清空 CUDA 缓存。
         torch.cuda.empty_cache() 
         
+        # 提取 Key 状态的唯一值和对应的逆索引，用于编码。
         self.unique_values_k = torch.unique(key_states_deq.flatten().float()[:10000], sorted=False).to(key_states_deq.dtype)
         unique_values = self.unique_values_k.clone().view(-1, *([1] * key_states_deq.dim()))
-        # unique_values = torch.tensor(self.unique_values_k, device=key_states_deq.device).view(-1, *([1] * key_states_deq.dim()))
         mask = (key_states_deq == unique_values) 
-    
         _, inverse_indices_k = mask.max(dim=0)
         self.unique_values_k = unique_values.view(-1)
     
+        # 提取 Value 状态的唯一值和对应的逆索引，用于编码。
         self.unique_values_v = torch.unique(value_states_deq.flatten().float()[:10000], sorted=False).to(value_states_deq.dtype)
-        # unique_values = torch.tensor(self.unique_values_v, device=value_states_deq.device).view(-1, *([1] * value_states_deq.dim()))
         unique_values = self.unique_values_v.clone().view(-1, *([1] * value_states_deq.dim()))
         mask = (value_states_deq == unique_values) 
-        
         _, inverse_indices_v = mask.max(dim=0)
         self.unique_values_v = unique_values.view(-1)
 
+        # 对 Key 的逆索引进行编码。
         self.encoded_features_k = encode(inverse_indices_k)
+        # 清空 CUDA 缓存。
         torch.cuda.empty_cache() 
         
+        # 将 Value 的唯一值转换为半精度浮点数。
         self.unique_values_v = self.unique_values_v.half()
+        # 对 Value 的逆索引进行编码。
         self.encoded_features_v = encode(inverse_indices_v)
+        # 清空 CUDA 缓存。
         torch.cuda.empty_cache() 
         
+    # 14. 计算注意力权重和输出 (当 `query_states.shape[1] == 1` 时，即单 token 生成)
     if query_states.shape[1] == 1:
+        # 清空 CUDA 缓存。
         torch.cuda.empty_cache() 
+        # 转置 Query, Key, Value 状态。
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
+        # 重复 Key 和 Value 状态以匹配 Query 的头数。
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
+        # 如果是低比特模式，则进行量化注意力计算。
         if LOW_BITS:
+            # 分割 Key 状态为系统提示部分和非图像 token 部分。
             key_states_quant_s = key_states[:,:,:self.sprompt_len,:]
             key_states_quant_t = key_states[:,:,self.sprompt_len:,:]
+            # 重复编码后的 Key 和 Value 特征。
             encoded_features_k = repeat_kv(self.encoded_features_k, self.num_key_value_groups)
             encoded_features_v = repeat_kv(self.encoded_features_v, self.num_key_value_groups)
             
+            # 计算系统提示部分和非图像 token 部分的注意力权重。
             attn_weights_quant_s = torch.matmul(query_states, key_states_quant_s.transpose(2, 3)) / math.sqrt(self.head_dim)
             attn_weights_quant_t = torch.matmul(query_states, key_states_quant_t.transpose(2, 3)) / math.sqrt(self.head_dim)
             
+            # 计算 Key 的偏置项。
             bias_k = self.scale_key * self.zero_point_key * query_states
             bias_k = torch.sum(bias_k,dim=-1,keepdim=True)/math.sqrt(self.head_dim)
 
+            # 使用 `fused_kernel` 计算图像部分的注意力权重，并减去偏置。
             attn_weights_quant_v = fused_kernel(self.unique_values_k, query_states * self.scale_key, encoded_features_k) / math.sqrt(self.head_dim)  - bias_k
             
+            # 如果需要归一化，则对图像部分的注意力权重进行归一化。
             if self.normalize:
                 current_max = attn_weights_quant_v.amax(dim=(2, 3), keepdim=True)
                 current_min = attn_weights_quant_v.amin(dim=(2, 3), keepdim=True)
@@ -294,61 +384,80 @@ def forward_internlm2_calibquant(
                 normalized_weights = normalized_weights * (target_max - target_min) + target_min
                 attn_weights_quant_v = normalized_weights
 
+            # 拼接所有部分的注意力权重。
             attn_weights_quant = torch.cat([attn_weights_quant_s, attn_weights_quant_v, attn_weights_quant_t],dim=-1)
+        # 否则，进行标准注意力计算。
         else:
             attn_weights_quant = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        # 将计算出的注意力权重赋值给 `attn_weights`。
         attn_weights = attn_weights_quant
         
+        # 检查注意力权重的尺寸是否正确。
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f'Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is'
                 f' {attn_weights.size()}'
             )
 
-
+        # 如果存在注意力掩码，则将其添加到注意力权重中。
         if attention_mask is not None:
+            # 检查注意力掩码的尺寸是否正确。
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
                     f'Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}'
                 )
             attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
+        # 将注意力权重上采样到 fp32，然后应用 softmax，再转换回原始数据类型。
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     
+        # 如果是低比特模式，则进行量化注意力输出计算。
         if LOW_BITS:
+            # 使用 `fused_kernel_wv` 计算图像部分的注意力输出。
             attn_output_v = fused_kernel_wv(self.unique_values_v.half(), attn_weights[:,:,:,self.sprompt_len:self.sprompt_len+self.image_token_num].half(), encoded_features_v) 
+            # 乘以缩放因子。
             attn_output_v = attn_output_v *  self.scale_value
+            # 计算 Value 的偏置项。
             bias_v = self.scale_value * self.zero_point_value * torch.sum(attn_weights[:,:,:,self.sprompt_len:self.sprompt_len+self.image_token_num],dim=-1,keepdim=True)
             
+            # 减去偏置。
             attn_output_v = attn_output_v - bias_v 
             
+            # 分割 Value 状态为系统提示部分和非图像 token 部分。
             value_states_s = value_states[:,:,:self.sprompt_len,:]
             value_states_t = value_states[:,:,self.sprompt_len:,:]
+            # 计算系统提示部分和非图像 token 部分的注意力输出。
             attn_output_s = torch.matmul(attn_weights[:,:,:,:self.sprompt_len], value_states_s)
             attn_output_t = torch.matmul(attn_weights[:,:,:,self.sprompt_len+self.image_token_num:], value_states_t)
+            # 拼接所有部分的注意力输出。
             attn_output = attn_output_v+attn_output_s+attn_output_t
+            # 将注意力输出转换为 bfloat16 精度。
             attn_output = attn_output.to(torch.bfloat16)
+        # 否则，进行标准注意力输出计算。
         else:
             attn_output = torch.matmul(attn_weights, value_states)
 
+        # 检查注意力输出的尺寸是否正确。
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f'`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is'
                 f' {attn_output.size()}'
             )
+        # 转置并连续化注意力输出。
         attn_output = attn_output.transpose(1, 2).contiguous()
+        # 重塑注意力输出。
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
+        # 通过输出线性层 `self.wo` 处理注意力输出。
         attn_output = self.wo(attn_output)
 
+        # 如果不输出注意力权重，则将其设置为 None。
         if not output_attentions:
             attn_weights = None
+    # 15. 计算注意力权重和输出 (当 `query_states.shape[1] > 1` 时，即多 token 生成)
     else:
-        # attn_output = self._flash_attention_forward(
-        #     query_states, key_states, value_states, attention_mask, q_len
-        # )
+        # 使用 `_flash_attention_forward` 分块计算注意力输出。
         attn_output = []
         seq_length = query_states.shape[1]
         
@@ -357,14 +466,21 @@ def forward_internlm2_calibquant(
             query_states[:,i:i+CHUNK_SIZE], key_states[:,:i+CHUNK_SIZE], value_states[:,:i+CHUNK_SIZE], attention_mask, query_states[:,:i+CHUNK_SIZE].shape[1]
             )   
             attn_output.append(attn_output_chunk)
+        # 删除不再需要的张量以释放内存。
         del query_states, key_states, value_states
+        # 拼接所有分块的注意力输出。
         attn_output = torch.cat(attn_output,dim=1)
+        # 重塑注意力输出。
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        # 通过输出线性层 `self.wo` 处理注意力输出。
         attn_output = self.wo(attn_output)
 
+        # 如果不输出注意力权重，则将其设置为 None。
         if not output_attentions:
             attn_weights = None
 
+    # 16. 返回结果
+    # 返回注意力输出、注意力权重和更新后的键值对缓存。
     return attn_output, attn_weights, past_key_value
 
 
