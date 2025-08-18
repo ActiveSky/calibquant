@@ -7,3 +7,5 @@ my_test/
 qjl_cuda.egg-info/
 
 .venv/
+
+**/build/
