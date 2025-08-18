@@ -5,3 +5,5 @@ my_test/
 **/__pycache__/
 
 qjl_cuda.egg-info/
+
+.venv/
